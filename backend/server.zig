@@ -1,3 +1,4 @@
+```zig
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -44,10 +45,12 @@ fn log(level: LogLevel, component: []const u8, msg: []const u8) void {
 fn iso8601Now(buf: []u8) []const u8 {
     const epoch_ms = std.time.milliTimestamp();
     const epoch_s: i64 = @divTrunc(epoch_ms, 1000);
-    const ms: u16 = @intCast(@mod(@as(i64, @intCast(epoch_ms)), 1000));
+    const ms_i: i64 = @mod(epoch_ms, 1000);
+    const ms: u16 = @intCast(if (ms_i < 0) ms_i + 1000 else ms_i);
     const ed = epochDayFromUnix(epoch_s);
     const ymd = dayToYmd(ed);
-    const day_secs: u32 = @intCast(@mod(epoch_s, 86400));
+    const day_secs_i: i64 = @mod(epoch_s, 86400);
+    const day_secs: u32 = @intCast(if (day_secs_i < 0) day_secs_i + 86400 else day_secs_i);
     const h: u32 = day_secs / 3600;
     const m: u32 = (@mod(day_secs, 3600)) / 60;
     const s: u32 = @mod(day_secs, 60);
@@ -59,17 +62,17 @@ fn epochDayFromUnix(unix: i64) i64 {
 }
 
 fn dayToYmd(day: i64) struct { y: i32, m: u32, d: u32 } {
-    var z = day + 719468;
-    const era = @divTrunc(if (z >= 0) z else z - 146096, 146097);
+    const z: i64 = day + 719468;
+    const era: i64 = @divTrunc(if (z >= 0) z else z - 146096, 146097);
     const doe: u32 = @intCast(z - era * 146097);
-    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
-    const mp = @divTrunc(5 * doy + 2, 153);
-    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
-    const m_raw = mp + if (mp < 10) @as(u32, 3) else @as(u32, @as(u32, 0) -% 9);
-    const y_final: i32 = @intCast(y + if (m_raw <= 2) 1 else 0);
-    return .{ .y = y_final, .m = m_raw, .d = @intCast(d) };
+    const yoe: u32 = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp: u32 = @divTrunc(5 * doy + 2, 153);
+    const d: u32 = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m_raw: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const y_final: i32 = @intCast(y + @as(i64, if (m_raw <= 2) 1 else 0));
+    return .{ .y = y_final, .m = m_raw, .d = d };
 }
 
 const Config = struct {
@@ -248,7 +251,7 @@ const Tab = struct {
     last_activity_ns: Atomic(i128),
     frame_queue_depth: Atomic(u32),
     allocator: Allocator,
-    cdp_reader_thread: ?*Thread,
+    cdp_reader_thread: ?Thread,
     cdp_running: Atomic(bool),
 };
 
@@ -352,10 +355,7 @@ fn loadConfig(allocator: Allocator, path: []const u8) !Config {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
-    const parsed = try json.parseFromSlice(Config, allocator, content, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    return parsed.value;
+    return try json.parseFromSliceLeaky(Config, allocator, content, .{ .ignore_unknown_fields = true });
 }
 
 fn loadProxies(allocator: Allocator, path: []const u8) !ArrayList(ProxyEntry) {
@@ -366,10 +366,8 @@ fn loadProxies(allocator: Allocator, path: []const u8) !ArrayList(ProxyEntry) {
     };
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
-    const parsed = try json.parseFromSlice([]ProxyEntry, allocator, content, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    for (parsed.value) |p| try list.append(p);
+    const arr = try json.parseFromSliceLeaky([]ProxyEntry, allocator, content, .{ .ignore_unknown_fields = true });
+    for (arr) |p| try list.append(p);
     return list;
 }
 
@@ -488,14 +486,17 @@ fn parseHttpRequest(reader: anytype, allocator: Allocator, buf: []u8) !HttpReque
         const already_have = total - header_end.?;
         if (already_have < len) {
             const need = len - already_have;
-            while (body.len < need) {
+            var initial = try allocator.alloc(u8, already_have);
+            @memcpy(initial, buf[header_end.? .. header_end.? + already_have]);
+            body = initial;
+            while (body.len < need + already_have) {
                 var tmp: [4096]u8 = undefined;
                 const n = try reader.read(&tmp);
                 if (n == 0) break;
                 const slice = try allocator.alloc(u8, body.len + n);
                 @memcpy(slice[0..body.len], body);
                 @memcpy(slice[body.len .. body.len + n], tmp[0..n]);
-                if (body.len > 0) allocator.free(body);
+                allocator.free(body);
                 body = slice;
             }
         } else {
@@ -742,7 +743,7 @@ fn terminateSession(state: *ServerState, session: *Session) void {
 fn terminateTab(state: *ServerState, tab: *Tab) void {
     tab.cdp_running.store(false, .monotonic);
     if (tab.child) |child| {
-        _ = child.kill() catch null;
+        _ = child.kill() catch std.process.Child.Term{ .Unknown = 0 };
         state.allocator.destroy(child);
     }
     if (tab.cdp_stdin) |f| f.close();
@@ -789,14 +790,13 @@ fn handleDownload(state: *ServerState, download_id: []const u8, sig: []const u8,
     }
     const header = try std.fmt.allocPrint(state.allocator, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nContent-Disposition: attachment; filename=\"{s}\"\r\nConnection: close\r\n\r\n", .{ d.mime, stat.size, d.filename });
     defer state.allocator.free(header);
-    var stream = writer;
-    try stream.writeAll(header);
+    try writer.writeAll(header);
     var buf: [65536]u8 = undefined;
     var remaining = stat.size;
     while (remaining > 0) {
         const n = try file.read(&buf);
         if (n == 0) break;
-        try stream.writeAll(buf[0..n]);
+        try writer.writeAll(buf[0..n]);
         remaining -= @min(remaining, n);
     }
     inc(&state.metrics.downloads_served, 1);
@@ -880,7 +880,6 @@ fn sendWsMessage(ws: *WebSocket, payload: []const u8) !void {
         return error.BackpressureOverflow;
     }
     try wsWriteFrame(ws.conn, &ws.write_mutex, .binary, payload);
-    inc(&ws.session.allocator.?.*, 0);
 }
 
 fn buildFrameMessage(allocator: Allocator, tab_id: u32, frame_seq: u32, w: u32, h: u32, ts_ns: u64, jpeg: []const u8) ![]u8 {
@@ -1033,12 +1032,8 @@ fn cdpSendCommand(tab: *Tab, method: []const u8, params: json.Value) !json.Value
     tab.cdp_pending_mutex.unlock();
 
     if (tab.cdp_stdin) |stdin| {
-        stdin.writeAll(payload.items) catch |err| {
-            inc(&tab.allocator.?.*, 0);
-            return err;
-        };
+        try stdin.writeAll(payload.items);
     } else return error.NoCdpPipe;
-    inc(&tab.allocator.?.*, 0);
 
     const deadline = nowNs() + @as(i128, @intCast(10_000)) * 1_000_000;
     while (!pending.done.load(.acquire)) {
@@ -1164,7 +1159,7 @@ fn startScreencast(state: *ServerState, tab: *Tab) !void {
     try params.put("maxWidth", json.Value{ .integer = tab.viewport_w.load(.monotonic) });
     try params.put("maxHeight", json.Value{ .integer = tab.viewport_h.load(.monotonic) });
     try params.put("everyNthFrame", json.Value{ .integer = 1 });
-    _ = cdpSendCommand(tab, "Page.startScreencast", json.Value{ .object = params }) catch null;
+    _ = cdpSendCommand(tab, "Page.startScreencast", json.Value{ .object = params }) catch json.Value{ .null = {} };
 }
 
 fn applyFingerprint(state: *ServerState, tab: *Tab) !void {
@@ -1191,14 +1186,14 @@ fn applyFingerprint(state: *ServerState, tab: *Tab) !void {
     });
     var params = std.json.ObjectMap.init(state.allocator);
     try params.put("source", json.Value{ .string = script.items });
-    _ = cdpSendCommand(tab, "Page.addScriptToEvaluateOnNewDocument", json.Value{ .object = params }) catch null;
+    _ = cdpSendCommand(tab, "Page.addScriptToEvaluateOnNewDocument", json.Value{ .object = params }) catch json.Value{ .null = {} };
 
     var hdr = std.json.ObjectMap.init(state.allocator);
     var headers = std.json.ObjectMap.init(state.allocator);
     try headers.put("Accept-Language", json.Value{ .string = state.config.accept_language_header });
     try headers.put("User-Agent", json.Value{ .string = state.config.fingerprint_user_agent });
     try hdr.put("headers", json.Value{ .object = headers });
-    _ = cdpSendCommand(tab, "Network.setExtraHTTPHeaders", json.Value{ .object = hdr }) catch null;
+    _ = cdpSendCommand(tab, "Network.setExtraHTTPHeaders", json.Value{ .object = hdr }) catch json.Value{ .null = {} };
 }
 
 fn handleNewTab(state: *ServerState, session: *Session) !*Tab {
@@ -1304,7 +1299,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
     if (payload.len < 1) return;
     const kind: InputType = @enumFromInt(payload[0]);
     inc(&state.metrics.bytes_in, @intCast(payload.len));
-    _ = ws.session.last_activity_ns.store(nowNs(), .monotonic);
+    ws.session.last_activity_ns.store(nowNs(), .monotonic);
     switch (kind) {
         .navigate => {
             if (payload.len < 3) return;
@@ -1318,7 +1313,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
             if (tab) |t| {
                 var params = std.json.ObjectMap.init(state.allocator);
                 try params.put("url", json.Value{ .string = url });
-                _ = cdpSendCommand(t, "Page.navigate", json.Value{ .object = params }) catch null;
+                _ = cdpSendCommand(t, "Page.navigate", json.Value{ .object = params }) catch json.Value{ .null = {} };
             }
         },
         .tab_control => {
@@ -1354,7 +1349,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                     const tab = ws.session.tabs.get(tab_id);
                     ws.session.tabs_mutex.unlock();
                     if (tab) |t| {
-                        _ = cdpSendCommand(t, "Page.reload", json.Value{ .null = {} }) catch null;
+                        _ = cdpSendCommand(t, "Page.reload", json.Value{ .null = {} }) catch json.Value{ .null = {} };
                     }
                 },
                 .stop => {
@@ -1363,7 +1358,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                     const tab = ws.session.tabs.get(tab_id);
                     ws.session.tabs_mutex.unlock();
                     if (tab) |t| {
-                        _ = cdpSendCommand(t, "Page.stopLoading", json.Value{ .null = {} }) catch null;
+                        _ = cdpSendCommand(t, "Page.stopLoading", json.Value{ .null = {} }) catch json.Value{ .null = {} };
                     }
                 },
                 .back => {
@@ -1372,7 +1367,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                     const tab = ws.session.tabs.get(tab_id);
                     ws.session.tabs_mutex.unlock();
                     if (tab) |t| {
-                        _ = cdpSendCommand(t, "Page.navigateToHistoryEntry", json.Value{ .null = {} }) catch null;
+                        _ = cdpSendCommand(t, "Page.navigateToHistoryEntry", json.Value{ .null = {} }) catch json.Value{ .null = {} };
                     }
                 },
                 .forward => {
@@ -1381,7 +1376,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                     const tab = ws.session.tabs.get(tab_id);
                     ws.session.tabs_mutex.unlock();
                     if (tab) |t| {
-                        _ = cdpSendCommand(t, "Page.navigateToHistoryEntry", json.Value{ .null = {} }) catch null;
+                        _ = cdpSendCommand(t, "Page.navigateToHistoryEntry", json.Value{ .null = {} }) catch json.Value{ .null = {} };
                     }
                 },
                 .duplicate, .thumbnail => {},
@@ -1404,10 +1399,10 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                 var params = std.json.ObjectMap.init(state.allocator);
                 try params.put("width", json.Value{ .integer = @intCast(w) });
                 try params.put("height", json.Value{ .integer = @intCast(h) });
-                try params.put("deviceScaleFactor", json.Value{ .float = scale });
+                try params.put("deviceScaleFactor", json.Value{ .float = @as(f64, scale) });
                 try params.put("mobile", json.Value{ .bool = false });
-                _ = cdpSendCommand(t, "Emulation.setDeviceMetricsOverride", json.Value{ .object = params }) catch null;
-                _ = cdpSendCommand(t, "Page.stopScreencast", json.Value{ .null = {} }) catch null;
+                _ = cdpSendCommand(t, "Emulation.setDeviceMetricsOverride", json.Value{ .object = params }) catch json.Value{ .null = {} };
+                _ = cdpSendCommand(t, "Page.stopScreencast", json.Value{ .null = {} }) catch json.Value{ .null = {} };
                 startScreencast(state, t) catch {};
             }
         },
@@ -1449,11 +1444,11 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                 try touches.append(json.Value{ .object = tp });
                 try params.put("touchPoints", json.Value{ .array = touches });
                 try params.put("modifiers", json.Value{ .integer = modifiers });
-                _ = cdpSendCommand(t, "Input.dispatchTouchEvent", json.Value{ .object = params }) catch null;
+                _ = cdpSendCommand(t, "Input.dispatchTouchEvent", json.Value{ .object = params }) catch json.Value{ .null = {} };
             }
         },
         .mouse => {
-            if (payload.len < 12) return;
+            if (payload.len < 13) return;
             const type_byte = payload[1];
             const button = payload[2];
             const x = std.mem.readInt(u32, payload[3..7][0..4], .little);
@@ -1485,11 +1480,11 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                 try params.put("button", json.Value{ .string = button_str });
                 try params.put("clickCount", json.Value{ .integer = 1 });
                 try params.put("modifiers", json.Value{ .integer = modifiers });
-                _ = cdpSendCommand(t, "Input.dispatchMouseEvent", json.Value{ .object = params }) catch null;
+                _ = cdpSendCommand(t, "Input.dispatchMouseEvent", json.Value{ .object = params }) catch json.Value{ .null = {} };
             }
         },
         .key => {
-            if (payload.len < 9) return;
+            if (payload.len < 10) return;
             const type_byte = payload[1];
             const modifiers = std.mem.readInt(u16, payload[2..4][0..2], .little);
             const key_code = std.mem.readInt(u32, payload[4..8][0..4], .little);
@@ -1512,7 +1507,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                 try params.put("windowsVirtualKeyCode", json.Value{ .integer = @intCast(key_code) });
                 try params.put("nativeVirtualKeyCode", json.Value{ .integer = @intCast(key_code) });
                 if (text.len > 0) try params.put("text", json.Value{ .string = text });
-                _ = cdpSendCommand(t, "Input.dispatchKeyEvent", json.Value{ .object = params }) catch null;
+                _ = cdpSendCommand(t, "Input.dispatchKeyEvent", json.Value{ .object = params }) catch json.Value{ .null = {} };
             }
         },
         .settings => {
@@ -1525,12 +1520,13 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
             if (parsed.value == .object) {
                 if (parsed.value.object.get("jpeg_quality")) |q| {
                     if (q == .integer) {
-                        const v: u8 = @intCast(@max(state.config.min_jpeg_quality, @min(state.config.max_jpeg_quality, @as(u8, @intCast(q.integer)))));
+                        const raw_u8: u8 = @intCast(q.integer);
+                        const clamped = @max(state.config.min_jpeg_quality, @min(state.config.max_jpeg_quality, raw_u8));
                         const tab_id = ws.session.active_tab_id.load(.monotonic);
                         ws.session.tabs_mutex.lock();
                         const tab = ws.session.tabs.get(tab_id);
                         ws.session.tabs_mutex.unlock();
-                        if (tab) |t| t.jpeg_quality.store(v, .monotonic);
+                        if (tab) |t| t.jpeg_quality.store(clamped, .monotonic);
                     }
                 }
             }
@@ -1549,7 +1545,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
                 if (tab) |t| {
                     var params = std.json.ObjectMap.init(state.allocator);
                     try params.put("text", json.Value{ .string = text });
-                    _ = cdpSendCommand(t, "Input.insertText", json.Value{ .object = params }) catch null;
+                    _ = cdpSendCommand(t, "Input.insertText", json.Value{ .object = params }) catch json.Value{ .null = {} };
                 }
             }
         },
@@ -1566,7 +1562,7 @@ fn handleClientMessage(state: *ServerState, ws: *WebSocket, payload: []const u8)
             if (tab) |t| {
                 var params = std.json.ObjectMap.init(state.allocator);
                 try params.put("sessionId", json.Value{ .integer = @intCast(t.screencast_session_id.load(.monotonic)) });
-                _ = cdpSendCommand(t, "Page.screencastFrameAck", json.Value{ .object = params }) catch null;
+                _ = cdpSendCommand(t, "Page.screencastFrameAck", json.Value{ .object = params }) catch json.Value{ .null = {} };
             }
         },
     }
@@ -1585,8 +1581,8 @@ fn handleWebSocket(state: *ServerState, conn: net.Stream, req: *HttpRequest) !vo
         try writePlainResponse(conn.writer(), "400 Bad Request", "missing key", "text/plain");
         return error.NotWebSocket;
     };
-    const q_index = std.mem.indexOfScalar(u8, req.path, '?') orelse req.path.len;
-    const query = req.path[q_index..];
+    const q_index_opt = std.mem.indexOfScalar(u8, req.path, '?');
+    const query: []const u8 = if (q_index_opt) |qi| req.path[qi + 1 ..] else "";
     var session_id_hex: []const u8 = "";
     var token_hex: []const u8 = "";
     var qit = std.mem.splitSequence(u8, query, "&");
@@ -1761,13 +1757,6 @@ fn cleanupLoop(state: *ServerState) void {
 
 const NullWriter = struct {
     pub const Error = error{};
-    pub const Writer = std.io.GenericWriter(NullWriter, Error, write);
-    pub fn writer(self: NullWriter) Writer {
-        return .{ .context = self };
-    }
-    pub fn write(_: NullWriter, bytes: []const u8) Error!usize {
-        return bytes.len;
-    }
     pub fn print(self: NullWriter, comptime fmt: []const u8, args: anytype) Error!void {
         _ = fmt;
         _ = args;
@@ -1777,22 +1766,26 @@ const NullWriter = struct {
         _ = self;
         _ = bytes;
     }
+    pub fn writeByte(self: NullWriter, b: u8) Error!void {
+        _ = self;
+        _ = b;
+    }
 };
 
 fn setupSignalHandlers() void {
-    const act = posix.Sigaction{
+    var act = posix.Sigaction{
         .handler = .{ .handler = handleSignal },
         .mask = posix.empty_sigset,
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.INT, &act, null) catch {};
-    posix.sigaction(posix.SIG.TERM, &act, null) catch {};
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.TERM, &act, null);
     var ign = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.empty_sigset,
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.PIPE, &ign, null) catch {};
+    posix.sigaction(posix.SIG.PIPE, &ign, null);
 }
 
 var signal_state_ptr: ?*ServerState = null;
@@ -1862,7 +1855,6 @@ pub fn main() !void {
     const addr = try net.Address.parseIp4(config.host, config.port);
     var listener = try addr.listen(.{
         .reuse_address = true,
-        .force_nonblocking = false,
     });
     defer listener.deinit();
     state.listener = listener;
@@ -1877,7 +1869,8 @@ pub fn main() !void {
             log(.warn, "http", @errorName(err));
             continue;
         };
-        _ = try Thread.spawn(.{}, connectionHandler, .{ &state, conn.connection });
+        const t = try Thread.spawn(.{}, connectionHandler, .{ &state, conn.stream });
+        t.detach();
     }
 
     log(.info, "http", "shutting down");
